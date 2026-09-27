@@ -9,141 +9,142 @@ on:
 jobs:
 
   # ───────────────────────────────────────────────────────────────────────────
-  # USERMODE — Ninja + MSVC (не требует полного VS, работает на любом раннере)
+  # USERMODE
+  # ilammy/msvc-dev-cmd ставит VS в окружение → cmake автоматически находит
+  # VS18 2026 (видно в логах). Ninja не нужен — убираем, оставляем автодетект.
+  # ^ в PS не работает как line-continuation (это cmd-синтаксис) — всё в одну строку.
   # ───────────────────────────────────────────────────────────────────────────
   build-usermode:
-    name: Usermode (CMake + Ninja)
+    name: Usermode (CMake)
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # Поднимает окружение MSVC: cl.exe / link.exe попадают в PATH,
-      # INCLUDE и LIB выставляются автоматически — аналог vcvarsall.bat x64
-      - name: Setup MSVC environment
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Configure CMake (Ninja, cl.exe)
+      - name: Configure
         working-directory: usermode
-        run: |
-          cmake -B build ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_C_COMPILER=cl ^
-            -DCMAKE_CXX_COMPILER=cl
+        run: cmake -B build
 
       - name: Build
         working-directory: usermode
-        run: cmake --build build
+        run: cmake --build build --config Release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RecoilComp-usermode
-          path: usermode/build/RecoilComp.exe
+          path: usermode/build/Release/RecoilComp.exe
 
   # ───────────────────────────────────────────────────────────────────────────
-  # DRIVER — WDK через NuGet (надёжнее offline installer) + cl.exe напрямую
+  # DRIVER
+  # NuGet-пакет версии 10.0.28000+ имеет другую структуру папок.
+  # Вместо хардкода пути — ищем ntddk.h рекурсивно и берём директорию оттуда.
   # ───────────────────────────────────────────────────────────────────────────
   build-driver:
-    name: Kernel Driver (WDK NuGet + cl.exe)
+    name: Kernel Driver (WDK NuGet)
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # cl.exe / link.exe в PATH, INCLUDE / LIB для MSVC выставлены
-      - name: Setup MSVC environment
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # WDK через NuGet — официальный путь для CI без GUI-установщика.
-      # nuget.exe pre-installed на windows-latest раннерах.
-      # Пакеты: WDK.x64 (km headers + km libs) + SDK.CPP (shared/um headers)
       - name: Install WDK NuGet packages
         run: |
-          nuget install Microsoft.Windows.WDK.x64      -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
-          nuget install Microsoft.Windows.SDK.CPP       -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
-          nuget install Microsoft.Windows.SDK.CPP.x64  -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.WDK.x64     -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP      -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP.x64 -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
 
       - name: Build kernel driver
         shell: pwsh
         run: |
-          # ── Находим папки пакетов (версия в имени, не хардкодим) ──────────
-          $wdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.WDK.x64.*" -Directory |
-                    Sort-Object Name -Descending | Select-Object -First 1
-          $sdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.SDK.CPP.*" -Directory |
-                    Where-Object { $_.Name -notmatch "x64" } |
-                    Sort-Object Name -Descending | Select-Object -First 1
-
-          if (-not $wdkPkg) { Write-Error "WDK package not found in C:\wdk"; exit 1 }
-          if (-not $sdkPkg) { Write-Error "SDK.CPP package not found in C:\wdk"; exit 1 }
-
-          $wdkRoot = $wdkPkg.FullName
-          $sdkRoot = $sdkPkg.FullName
-
-          $kmInc  = "$wdkRoot\c\km"
-          $shInc  = "$sdkRoot\c\shared"
-          $umInc  = "$sdkRoot\c\um"
-          $kmLib  = "$wdkRoot\lib\km\x64"
-
-          Write-Host "[*] WDK : $wdkRoot"
-          Write-Host "[*] SDK : $sdkRoot"
-          Write-Host "[*] kmInc: $kmInc"
-          Write-Host "[*] kmLib: $kmLib"
-
-          # ── Проверяем ntddk.h ────────────────────────────────────────────
-          if (-not (Test-Path "$kmInc\ntddk.h")) {
-            Write-Error "ntddk.h NOT FOUND at $kmInc"
-            Get-ChildItem $wdkRoot -Recurse -Filter "ntddk.h" | Select-Object FullName
+          # ── Найти ntddk.h рекурсивно — не завязываться на структуру пакета ──
+          Write-Host "Searching for ntddk.h under C:\wdk ..."
+          $ntddkFile = Get-ChildItem "C:\wdk" -Recurse -Filter "ntddk.h" -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+          if (-not $ntddkFile) {
+            Write-Host "ntddk.h not found. Package contents:"
+            Get-ChildItem "C:\wdk" -Recurse -Depth 4 | Select-Object FullName | Format-Table -AutoSize
+            Write-Error "ntddk.h not found — NuGet package layout unexpected"
             exit 1
           }
-          Write-Host "[OK] ntddk.h found"
+          $kmInc = $ntddkFile.Directory.FullName
+          Write-Host "[OK] kmInc = $kmInc"
 
-          # ── obj папка ────────────────────────────────────────────────────
+          # ── shared/um: найти basetsd.h (shared) и windows.h (um) ──────────
+          $basetsd = Get-ChildItem "C:\wdk" -Recurse -Filter "basetsd.h" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          $windowsh = Get-ChildItem "C:\wdk" -Recurse -Filter "windows.h" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+
+          $shInc = if ($basetsd)  { $basetsd.Directory.FullName }  else { "" }
+          $umInc = if ($windowsh) { $windowsh.Directory.FullName } else { "" }
+          Write-Host "[*] shInc = $shInc"
+          Write-Host "[*] umInc = $umInc"
+
+          # ── ntoskrnl.lib → km lib path ────────────────────────────────────
+          $ntoskrnl = Get-ChildItem "C:\wdk" -Recurse -Filter "ntoskrnl.lib" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match "\\x64" } |
+                      Select-Object -First 1
+          if (-not $ntoskrnl) {
+            Write-Error "ntoskrnl.lib not found under C:\wdk"
+            exit 1
+          }
+          $kmLib = $ntoskrnl.Directory.FullName
+          Write-Host "[OK] kmLib = $kmLib"
+
+          # ── obj folder ────────────────────────────────────────────────────
           New-Item -ItemType Directory -Force -Path driver\obj | Out-Null
 
-          # ── Компилируем каждый .c ────────────────────────────────────────
+          # ── Compile ───────────────────────────────────────────────────────
+          $iFlags = @("/I`"$kmInc`"")
+          if ($shInc) { $iFlags += "/I`"$shInc`"" }
+          if ($umInc) { $iFlags += "/I`"$umInc`"" }
+          $iFlags += "/I`"usermode`""
+
           $sources = @("driver\driver.c", "driver\evasion.c", "driver\mouse_filter.c")
           foreach ($src in $sources) {
             $obj = "driver\obj\" + [IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
-            Write-Host "CC $src -> $obj"
+            Write-Host "CC  $src"
 
-            # ilammy/msvc-dev-cmd уже поставил cl.exe в PATH
-            cl.exe /nologo /c `
-              /I"$kmInc" /I"$shInc" /I"$umInc" /I"usermode" `
-              /kernel /GS- /Gz /GF /Gm- /EHs-c- /MT `
-              /W4 /WX- /O2 /Oi `
-              /D_KERNEL_MODE /D_AMD64_ /DAMD64 /D_WIN64 /DNDEBUG `
-              /Fo"$obj" "$src"
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Compile failed: $src (exit $LASTEXITCODE)"
-              exit 1
-            }
+            $clArgs = @("/nologo", "/c") + $iFlags + @(
+              "/kernel", "/GS-", "/Gz", "/GF", "/Gm-", "/EHs-c-", "/MT",
+              "/W4", "/WX-", "/O2", "/Oi",
+              "/D_KERNEL_MODE", "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
+              "/Fo`"$obj`"", "`"$src`""
+            )
+            & cl.exe @clArgs
+            if ($LASTEXITCODE -ne 0) { Write-Error "Compile failed: $src"; exit 1 }
           }
 
-          # ── Линкуем в .sys ───────────────────────────────────────────────
-          $objs = (Get-ChildItem driver\obj\*.obj | ForEach-Object { "`"$($_.FullName)`"" }) -join " "
-          Write-Host "LINK -> driver\recoil.sys"
+          # ── Link ──────────────────────────────────────────────────────────
+          Write-Host "LINK driver\recoil.sys"
+          $objs = (Get-ChildItem driver\obj\*.obj | ForEach-Object { "`"$($_.FullName)`"" })
 
-          Invoke-Expression ("link.exe /nologo " +
-            "/SUBSYSTEM:NATIVE /DRIVER:WDM /NODEFAULTLIB /ENTRY:DriverEntry " +
-            "/LIBPATH:`"$kmLib`" " +
-            "ntoskrnl.lib hal.lib wdm.lib wdmsec.lib wmilib.lib BufferOverflowFastFailK.lib " +
-            "/OUT:driver\recoil.sys /MAP:driver\recoil.map " +
-            $objs)
+          $linkArgs = @(
+            "/nologo",
+            "/SUBSYSTEM:NATIVE", "/DRIVER:WDM",
+            "/NODEFAULTLIB", "/ENTRY:DriverEntry",
+            "/LIBPATH:`"$kmLib`"",
+            "ntoskrnl.lib", "hal.lib", "wdm.lib", "wdmsec.lib", "wmilib.lib",
+            "BufferOverflowFastFailK.lib",
+            "/OUT:driver\recoil.sys",
+            "/MAP:driver\recoil.map"
+          ) + $objs
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Link failed (exit $LASTEXITCODE)"
-            exit 1
-          }
+          & link.exe @linkArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "Link failed"; exit 1 }
 
           $sz = (Get-Item driver\recoil.sys).Length
-          Write-Host "[OK] driver\recoil.sys built — $sz bytes"
+          Write-Host "[OK] recoil.sys — $sz bytes"
 
       - name: Upload driver artifact
         uses: actions/upload-artifact@v4
