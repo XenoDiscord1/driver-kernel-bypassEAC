@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSVC environment
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -22,6 +22,7 @@ jobs:
           cd usermode
           cl.exe /std:c++17 /EHsc /O2 /W3 /MT ^
             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+            /FI"winioctl.h" ^
             main.cpp recoil.cpp logger.cpp profile.cpp overlay.cpp ^
             /Fe:RecoilComp.exe ^
             /link /SUBSYSTEM:WINDOWS ^
@@ -41,40 +42,47 @@ jobs:
       - name: Setup MSVC
         uses: microsoft/setup-msbuild@v1
 
-      - name: Install Windows SDK + WDK
+      - name: Install WDK
         shell: powershell
         run: |
+          $VS = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+
           Write-Host "[*] Downloading SDK..."
           $sdk = "$env:TEMP\sdksetup.exe"
           Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2272610" `
             -OutFile $sdk -UseBasicParsing
           Write-Host "[*] Installing SDK..."
-          Start-Process $sdk -ArgumentList "/features + /q /norestart /ceip off" `
+          Start-Process $sdk `
+            -ArgumentList "/features + /q /norestart /ceip off" `
             -Wait -NoNewWindow
 
           Write-Host "[*] Downloading WDK..."
           $wdk = "$env:TEMP\wdksetup.exe"
           Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2249371" `
             -OutFile $wdk -UseBasicParsing
-          Write-Host "[*] Installing WDK..."
-          Start-Process $wdk -ArgumentList "/features + /q /norestart /ceip off" `
+          Write-Host "[*] Installing WDK + VS extension..."
+          Start-Process $wdk `
+            -ArgumentList "/features + /q /norestart /ceip off /vsPath `"$VS`"" `
             -Wait -NoNewWindow
 
-          Write-Host "[*] Checking WDK props..."
-          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
-          Get-ChildItem "$kitsRoot\Include" | Sort-Object Name -Descending |
-            Select-Object -First 3 | Write-Host
-          Test-Path "$kitsRoot\build\WindowsDriver.Default.props" | Write-Host
+          $props = "C:\Program Files (x86)\Windows Kits\10\build\WindowsDriver.Default.props"
+          Write-Host "[check] Props exists: $(Test-Path $props)"
+
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" |
+            Where-Object { $_.Name -match "^10\." } |
+            Sort-Object Name -Descending |
+            Select-Object -First 3 |
+            ForEach-Object { Write-Host $_.Name }
 
       - name: Build driver
         shell: cmd
         run: |
-          for /f "delims=" %%v in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\Include\" ^| sort /r') do (
+          for /f "delims=" %%v in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\Include\" ^| findstr /r "^10\." ^| sort /r') do (
             set "WDKVER=%%v"
             goto :found
           )
           :found
-          echo WDK version: %WDKVER%
+          echo [*] WDK version: %WDKVER%
           msbuild driver\RecoilDriver.vcxproj ^
             /p:Configuration=Release ^
             /p:Platform=x64 ^
