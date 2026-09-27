@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{AABBCCDD-1234-5678-ABCD-DEADBEEF0001}</ProjectGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>14.0</MinimumVisualStudioVersion>
+    <Configuration>Release</Configuration>
+    <Platform>x64</Platform>
+    <ProjectName>RecoilDriver</ProjectName>
+    <WDKContentRoot>$(Registry:HKEY_LOCAL_MACHINE\Software\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</WDKContentRoot>
+  </PropertyGroup>
+
+  <Import Project="$(WDKContentRoot)build\WindowsDriver.Default.props" />
+
+  <PropertyGroup>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <Platform>x64</Platform>
+    <TargetOsVersion>10.0</TargetOsVersion>
+    <TargetPlatform>Desktop</TargetPlatform>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WppEnabled>false</WppEnabled>
+    <OutDir>$(SolutionDir)bin\Release\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(ProjectName)\</IntDir>
+    <TargetName>recoil</TargetName>
+    <TargetExt>.sys</TargetExt>
+  </PropertyGroup>
+
+  <Import Project="$(WDKContentRoot)build\WindowsDriver.props" />
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>
+        $(WDKContentRoot)Include\$(LatestTargetPlatformVersion)\km;
+        $(WDKContentRoot)Include\$(LatestTargetPlatformVersion)\shared;
+        $(WDKContentRoot)Include\$(LatestTargetPlatformVersion)\km\crt;
+        $(SolutionDir)usermode;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        _AMD64_;NDEBUG;_KERNEL_MODE;
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <Optimization>O2</Optimization>
+      <WarnAsError>false</WarnAsError>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <ExceptionHandling>false</ExceptionHandling>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>
+        $(WDKContentRoot)Lib\$(LatestTargetPlatformVersion)\km\x64;
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        ntoskrnl.lib;hal.lib;wdm.lib;wdmsec.lib;wmilib.lib;
+        %(AdditionalDependencies)
+      </AdditionalDependencies>
+      <ModuleDefinitionFile></ModuleDefinitionFile>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <Driver>true</Driver>
+      <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+      <BaseAddress>0x10000</BaseAddress>
+      <StackCommitSize></StackCommitSize>
+      <StackReserveSize></StackReserveSize>
+      <MergeSection></MergeSection>
+      <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
+    </Link>
+    <Inf>
+      <TimeStampFile></TimeStampFile>
+    </Inf>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="driver.c" />
+    <ClCompile Include="evasion.c" />
+    <ClCompile Include="mouse_filter.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="driver.h" />
+    <ClInclude Include="..\usermode\driver_shared.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Inf Include="driver.inf" />
+  </ItemGroup>
+
+  <Import Project="$(WDKContentRoot)build\WindowsDriver.targets" />
+
+</Project>
