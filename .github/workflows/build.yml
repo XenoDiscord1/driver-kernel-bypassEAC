@@ -10,36 +10,78 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: microsoft/setup-msbuild@v1
-      - name: Configure CMake
-        run: cmake -S usermode -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
         shell: cmd
-      - name: Build
-        run: cmake --build build --config Release
-        shell: cmd
+        run: |
+          cd usermode
+          cl.exe /std:c++17 /EHsc /O2 /W3 /MT ^
+            /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+            main.cpp recoil.cpp logger.cpp profile.cpp overlay.cpp ^
+            /Fe:RecoilComp.exe ^
+            /link /SUBSYSTEM:WINDOWS ^
+            user32.lib shell32.lib kernel32.lib advapi32.lib
+
       - uses: actions/upload-artifact@v4
         with:
           name: RecoilComp-usermode
-          path: build\Release\RecoilComp.exe
+          path: usermode\RecoilComp.exe
 
   build-driver:
     name: Driver
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: microsoft/setup-msbuild@v1
-      - name: Install WDK
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v1
+
+      - name: Install Windows SDK + WDK
         shell: powershell
         run: |
-          $wdk = "$env:TEMP\wdk.exe"
-          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2249371" -OutFile $wdk -UseBasicParsing
-          Start-Process $wdk -ArgumentList "/q /norestart" -Wait -NoNewWindow
+          Write-Host "[*] Downloading SDK..."
+          $sdk = "$env:TEMP\sdksetup.exe"
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2272610" `
+            -OutFile $sdk -UseBasicParsing
+          Write-Host "[*] Installing SDK..."
+          Start-Process $sdk -ArgumentList "/features + /q /norestart /ceip off" `
+            -Wait -NoNewWindow
+
+          Write-Host "[*] Downloading WDK..."
+          $wdk = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2249371" `
+            -OutFile $wdk -UseBasicParsing
+          Write-Host "[*] Installing WDK..."
+          Start-Process $wdk -ArgumentList "/features + /q /norestart /ceip off" `
+            -Wait -NoNewWindow
+
+          Write-Host "[*] Checking WDK props..."
+          $kitsRoot = "C:\Program Files (x86)\Windows Kits\10"
+          Get-ChildItem "$kitsRoot\Include" | Sort-Object Name -Descending |
+            Select-Object -First 3 | Write-Host
+          Test-Path "$kitsRoot\build\WindowsDriver.Default.props" | Write-Host
+
       - name: Build driver
         shell: cmd
         run: |
-          for /f "delims=" %%v in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\Include\" ^| sort /r') do (set WDK=%%v & goto found)
+          for /f "delims=" %%v in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\Include\" ^| sort /r') do (
+            set "WDKVER=%%v"
+            goto :found
+          )
           :found
-          msbuild driver\RecoilDriver.vcxproj /p:Configuration=Release /p:Platform=x64 /p:LatestTargetPlatformVersion=%WDK% /v:minimal
+          echo WDK version: %WDKVER%
+          msbuild driver\RecoilDriver.vcxproj ^
+            /p:Configuration=Release ^
+            /p:Platform=x64 ^
+            /p:LatestTargetPlatformVersion=%WDKVER% ^
+            /p:WindowsTargetPlatformVersion=%WDKVER% ^
+            /v:minimal
+
       - uses: actions/upload-artifact@v4
         with:
           name: RecoilDriver-sys
@@ -47,3 +89,4 @@ jobs:
             bin\Release\recoil.sys
             driver\install.bat
             driver\uninstall.bat
+            driver\driver.inf
