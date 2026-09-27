@@ -7,158 +7,143 @@ on:
     branches: [main]
 
 jobs:
-  # ─────────────────────────────────────────────
-  # USERMODE — CMake + MSVC, как у тебя и работало
-  # ─────────────────────────────────────────────
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # USERMODE — Ninja + MSVC (не требует полного VS, работает на любом раннере)
+  # ───────────────────────────────────────────────────────────────────────────
   build-usermode:
-    name: Usermode (CMake)
+    name: Usermode (CMake + Ninja)
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure CMake
+      # Поднимает окружение MSVC: cl.exe / link.exe попадают в PATH,
+      # INCLUDE и LIB выставляются автоматически — аналог vcvarsall.bat x64
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake (Ninja, cl.exe)
         working-directory: usermode
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        run: |
+          cmake -B build ^
+            -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER=cl ^
+            -DCMAKE_CXX_COMPILER=cl
 
       - name: Build
         working-directory: usermode
-        run: cmake --build build --config Release
+        run: cmake --build build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RecoilComp-usermode
-          path: usermode/build/Release/RecoilComp.exe
+          path: usermode/build/RecoilComp.exe
 
-  # ─────────────────────────────────────────────
-  # DRIVER — WDK + cl.exe напрямую, без CMake
-  # ─────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────────
+  # DRIVER — WDK через NuGet (надёжнее offline installer) + cl.exe напрямую
+  # ───────────────────────────────────────────────────────────────────────────
   build-driver:
-    name: Kernel Driver (WDK)
+    name: Kernel Driver (WDK NuGet + cl.exe)
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # Ставим WDK через winget — самый надёжный путь в GitHub-hosted runners
-      - name: Install WDK
+      # cl.exe / link.exe в PATH, INCLUDE / LIB для MSVC выставлены
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # WDK через NuGet — официальный путь для CI без GUI-установщика.
+      # nuget.exe pre-installed на windows-latest раннерах.
+      # Пакеты: WDK.x64 (km headers + km libs) + SDK.CPP (shared/um headers)
+      - name: Install WDK NuGet packages
+        run: |
+          nuget install Microsoft.Windows.WDK.x64      -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP       -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+          nuget install Microsoft.Windows.SDK.CPP.x64  -OutputDirectory C:\wdk -NonInteractive -Verbosity quiet
+
+      - name: Build kernel driver
         shell: pwsh
         run: |
-          # Качаем WDK offline installer напрямую с Microsoft
-          $wdkUrl  = "https://go.microsoft.com/fwlink/?linkid=2249371"   # WDK for Windows 11 24H2
-          $sdkUrl  = "https://go.microsoft.com/fwlink/?linkid=2249910"   # SDK matching build
-          $wdkInst = "$env:TEMP\wdksetup.exe"
-          $sdkInst = "$env:TEMP\winsdksetup.exe"
+          # ── Находим папки пакетов (версия в имени, не хардкодим) ──────────
+          $wdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.WDK.x64.*" -Directory |
+                    Sort-Object Name -Descending | Select-Object -First 1
+          $sdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.SDK.CPP.*" -Directory |
+                    Where-Object { $_.Name -notmatch "x64" } |
+                    Sort-Object Name -Descending | Select-Object -First 1
 
-          Write-Host "Downloading SDK..."
-          Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkInst -UseBasicParsing
-          Write-Host "Installing SDK (headers + libs only)..."
-          Start-Process -Wait -FilePath $sdkInst -ArgumentList `
-            "/features OptionId.DesktopCPPx64 /quiet /norestart"
+          if (-not $wdkPkg) { Write-Error "WDK package not found in C:\wdk"; exit 1 }
+          if (-not $sdkPkg) { Write-Error "SDK.CPP package not found in C:\wdk"; exit 1 }
 
-          Write-Host "Downloading WDK..."
-          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInst -UseBasicParsing
-          Write-Host "Installing WDK..."
-          Start-Process -Wait -FilePath $wdkInst -ArgumentList "/quiet /norestart"
+          $wdkRoot = $wdkPkg.FullName
+          $sdkRoot = $sdkPkg.FullName
 
-      # Находим пути и компилируем — INCLUDE передаётся явно через /I
-      - name: Find WDK paths and build driver
-        shell: pwsh
-        run: |
-          # ── Ищем MSVC cl.exe ──────────────────────────────────────────
-          $vsBase = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
-          $msvcVer = (Get-ChildItem $vsBase | Sort-Object Name -Descending | Select-Object -First 1).Name
-          $cl = "$vsBase\$msvcVer\bin\Hostx64\x64\cl.exe"
-          $link = "$vsBase\$msvcVer\bin\Hostx64\x64\link.exe"
-          Write-Host "cl.exe  : $cl"
-          Write-Host "link.exe: $link"
+          $kmInc  = "$wdkRoot\c\km"
+          $shInc  = "$sdkRoot\c\shared"
+          $umInc  = "$sdkRoot\c\um"
+          $kmLib  = "$wdkRoot\lib\km\x64"
 
-          # ── Ищем WDK km headers ───────────────────────────────────────
-          $wdkBase = "C:\Program Files (x86)\Windows Kits\10"
-          $kitsVer = (Get-ChildItem "$wdkBase\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
-          $kmInc  = "$wdkBase\Include\$kitsVer\km"
-          $shInc  = "$wdkBase\Include\$kitsVer\shared"
-          $ucInc  = "$wdkBase\Include\$kitsVer\um"
-          $kmLib  = "$wdkBase\Lib\$kitsVer\km\x64"
-          $umLib  = "$wdkBase\Lib\$kitsVer\um\x64"
+          Write-Host "[*] WDK : $wdkRoot"
+          Write-Host "[*] SDK : $sdkRoot"
+          Write-Host "[*] kmInc: $kmInc"
+          Write-Host "[*] kmLib: $kmLib"
 
-          # ── MSVC CRT lib ──────────────────────────────────────────────
-          $msvcLib = "$vsBase\$msvcVer\lib\x64"
-
-          Write-Host "KM inc : $kmInc"
-          Write-Host "Shared : $shInc"
-          Write-Host "UM inc : $ucInc"
-          Write-Host "KM lib : $kmLib"
-
-          # ── Проверяем ntddk.h ─────────────────────────────────────────
+          # ── Проверяем ntddk.h ────────────────────────────────────────────
           if (-not (Test-Path "$kmInc\ntddk.h")) {
-              Write-Error "ntddk.h NOT FOUND at $kmInc — WDK install failed"
-              exit 1
+            Write-Error "ntddk.h NOT FOUND at $kmInc"
+            Get-ChildItem $wdkRoot -Recurse -Filter "ntddk.h" | Select-Object FullName
+            exit 1
           }
           Write-Host "[OK] ntddk.h found"
 
-          # ── Создаём obj папку ─────────────────────────────────────────
+          # ── obj папка ────────────────────────────────────────────────────
           New-Item -ItemType Directory -Force -Path driver\obj | Out-Null
 
-          # ── Список исходников ─────────────────────────────────────────
+          # ── Компилируем каждый .c ────────────────────────────────────────
           $sources = @("driver\driver.c", "driver\evasion.c", "driver\mouse_filter.c")
-
-          # ── Компилируем каждый .c в .obj ─────────────────────────────
           foreach ($src in $sources) {
-              $obj = "driver\obj\" + [System.IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
-              Write-Host "Compiling $src -> $obj"
-              & $cl `
-                /nologo /c `
-                /I"$kmInc" /I"$shInc" /I"$ucInc" `
-                /kernel /GS- /Gz /GF /Gm- /EHs-c- /MT /W4 /WX- /O2 /Oi `
-                /D_KERNEL_MODE /D_AMD64_ /DAMD64 /D_WIN64 /DNDEBUG `
-                /D_UNICODE /DUNICODE `
-                /Fo"$obj" `
-                "$src"
-              if ($LASTEXITCODE -ne 0) { Write-Error "Compile failed: $src"; exit 1 }
+            $obj = "driver\obj\" + [IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
+            Write-Host "CC $src -> $obj"
+
+            # ilammy/msvc-dev-cmd уже поставил cl.exe в PATH
+            cl.exe /nologo /c `
+              /I"$kmInc" /I"$shInc" /I"$umInc" /I"usermode" `
+              /kernel /GS- /Gz /GF /Gm- /EHs-c- /MT `
+              /W4 /WX- /O2 /Oi `
+              /D_KERNEL_MODE /D_AMD64_ /DAMD64 /D_WIN64 /DNDEBUG `
+              /Fo"$obj" "$src"
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Compile failed: $src (exit $LASTEXITCODE)"
+              exit 1
+            }
           }
 
-          # ── Линкуем в .sys ────────────────────────────────────────────
-          $objs = (Get-ChildItem driver\obj\*.obj).FullName -join " "
-          Write-Host "Linking -> driver\recoil.sys"
-          & $link `
-            /nologo /SUBSYSTEM:NATIVE /DRIVER:WDM `
-            /NODEFAULTLIB /ENTRY:DriverEntry `
-            /LIBPATH:"$kmLib" /LIBPATH:"$msvcLib" `
-            ntoskrnl.lib hal.lib wdm.lib BufferOverflowFastFailK.lib `
-            /OUT:driver\recoil.sys `
-            /MAP:driver\recoil.map `
-            $objs
-          if ($LASTEXITCODE -ne 0) { Write-Error "Link failed"; exit 1 }
+          # ── Линкуем в .sys ───────────────────────────────────────────────
+          $objs = (Get-ChildItem driver\obj\*.obj | ForEach-Object { "`"$($_.FullName)`"" }) -join " "
+          Write-Host "LINK -> driver\recoil.sys"
 
-          Write-Host "[OK] driver\recoil.sys built successfully"
-          $size = (Get-Item driver\recoil.sys).Length
-          Write-Host "Size: $size bytes"
+          Invoke-Expression ("link.exe /nologo " +
+            "/SUBSYSTEM:NATIVE /DRIVER:WDM /NODEFAULTLIB /ENTRY:DriverEntry " +
+            "/LIBPATH:`"$kmLib`" " +
+            "ntoskrnl.lib hal.lib wdm.lib wdmsec.lib wmilib.lib BufferOverflowFastFailK.lib " +
+            "/OUT:driver\recoil.sys /MAP:driver\recoil.map " +
+            $objs)
 
-      # ── install.bat для ручного теста ─────────────────────────────────
-      - name: Generate install.bat
-        shell: pwsh
-        run: |
-          $bat = @'
-          @echo off
-          :: Запускать от администратора
-          set SVC_NAME=RecoilDriver
-          set SYS_PATH=%~dp0recoil.sys
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Link failed (exit $LASTEXITCODE)"
+            exit 1
+          }
 
-          sc stop  %SVC_NAME% >nul 2>&1
-          sc delete %SVC_NAME% >nul 2>&1
-
-          sc create %SVC_NAME% type= kernel binPath= "%SYS_PATH%"
-          sc start  %SVC_NAME%
-          if %errorlevel% neq 0 (
-              echo [FAIL] Driver failed to start. Check with: sc query %SVC_NAME%
-              echo        Or check Event Viewer - Windows Logs - System
-              exit /b 1
-          )
-          echo [OK] Driver loaded.
-          '@
-          $bat | Out-File -FilePath driver\install.bat -Encoding ascii
+          $sz = (Get-Item driver\recoil.sys).Length
+          Write-Host "[OK] driver\recoil.sys built — $sz bytes"
 
       - name: Upload driver artifact
         uses: actions/upload-artifact@v4
