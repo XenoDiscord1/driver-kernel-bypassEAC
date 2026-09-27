@@ -8,12 +8,7 @@ on:
 
 jobs:
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # USERMODE
-  # ilammy/msvc-dev-cmd ставит VS в окружение → cmake автоматически находит
-  # VS18 2026 (видно в логах). Ninja не нужен — убираем, оставляем автодетект.
-  # ^ в PS не работает как line-continuation (это cmd-синтаксис) — всё в одну строку.
-  # ───────────────────────────────────────────────────────────────────────────
+  # ── USERMODE — работает с прошлого раза, не трогаем ────────────────────────
   build-usermode:
     name: Usermode (CMake)
     runs-on: windows-latest
@@ -40,11 +35,7 @@ jobs:
           name: RecoilComp-usermode
           path: usermode/build/Release/RecoilComp.exe
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # DRIVER
-  # NuGet-пакет версии 10.0.28000+ имеет другую структуру папок.
-  # Вместо хардкода пути — ищем ntddk.h рекурсивно и берём директорию оттуда.
-  # ───────────────────────────────────────────────────────────────────────────
+  # ── DRIVER ──────────────────────────────────────────────────────────────────
   build-driver:
     name: Kernel Driver (WDK NuGet)
     runs-on: windows-latest
@@ -66,74 +57,75 @@ jobs:
       - name: Build kernel driver
         shell: pwsh
         run: |
-          # ── Найти ntddk.h рекурсивно — не завязываться на структуру пакета ──
-          Write-Host "Searching for ntddk.h under C:\wdk ..."
+          # ── Находим пути рекурсивным поиском (не зависим от версии пакета) ──
+
           $ntddkFile = Get-ChildItem "C:\wdk" -Recurse -Filter "ntddk.h" -ErrorAction SilentlyContinue |
                        Select-Object -First 1
-          if (-not $ntddkFile) {
-            Write-Host "ntddk.h not found. Package contents:"
-            Get-ChildItem "C:\wdk" -Recurse -Depth 4 | Select-Object FullName | Format-Table -AutoSize
-            Write-Error "ntddk.h not found — NuGet package layout unexpected"
-            exit 1
-          }
+          if (-not $ntddkFile) { Write-Error "ntddk.h not found"; exit 1 }
           $kmInc = $ntddkFile.Directory.FullName
-          Write-Host "[OK] kmInc = $kmInc"
 
-          # ── shared/um: найти basetsd.h (shared) и windows.h (um) ──────────
-          $basetsd = Get-ChildItem "C:\wdk" -Recurse -Filter "basetsd.h" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
+          $basetsd  = Get-ChildItem "C:\wdk" -Recurse -Filter "basetsd.h" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
           $windowsh = Get-ChildItem "C:\wdk" -Recurse -Filter "windows.h" -ErrorAction SilentlyContinue |
                       Select-Object -First 1
+          $shInc = if ($basetsd)  { $basetsd.Directory.FullName }  else { $null }
+          $umInc = if ($windowsh) { $windowsh.Directory.FullName } else { $null }
 
-          $shInc = if ($basetsd)  { $basetsd.Directory.FullName }  else { "" }
-          $umInc = if ($windowsh) { $windowsh.Directory.FullName } else { "" }
+          $ntoskrnlLib = Get-ChildItem "C:\wdk" -Recurse -Filter "ntoskrnl.lib" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -match "\\x64" } |
+                         Select-Object -First 1
+          if (-not $ntoskrnlLib) { Write-Error "ntoskrnl.lib not found"; exit 1 }
+          $kmLib = $ntoskrnlLib.Directory.FullName
+
+          Write-Host "[*] kmInc = $kmInc"
           Write-Host "[*] shInc = $shInc"
           Write-Host "[*] umInc = $umInc"
+          Write-Host "[*] kmLib = $kmLib"
 
-          # ── ntoskrnl.lib → km lib path ────────────────────────────────────
-          $ntoskrnl = Get-ChildItem "C:\wdk" -Recurse -Filter "ntoskrnl.lib" -ErrorAction SilentlyContinue |
-                      Where-Object { $_.FullName -match "\\x64" } |
-                      Select-Object -First 1
-          if (-not $ntoskrnl) {
-            Write-Error "ntoskrnl.lib not found under C:\wdk"
-            exit 1
-          }
-          $kmLib = $ntoskrnl.Directory.FullName
-          Write-Host "[OK] kmLib = $kmLib"
-
-          # ── obj folder ────────────────────────────────────────────────────
           New-Item -ItemType Directory -Force -Path driver\obj | Out-Null
 
           # ── Compile ───────────────────────────────────────────────────────
-          $iFlags = @("/I`"$kmInc`"")
-          if ($shInc) { $iFlags += "/I`"$shInc`"" }
-          if ($umInc) { $iFlags += "/I`"$umInc`"" }
-          $iFlags += "/I`"usermode`""
+          # При & exe @array кавычки НЕ нужны — PS splatting передаёт аргументы
+          # как отдельные элементы через ProcessStartInfo напрямую.
+          # Бэктик-кавычки `"path`" внутри элементов = буквальные " в строке
+          # → cl.exe видит расширение " вместо .c и игнорирует файл (D9027).
+
+          $iFlags = @("/I$kmInc")
+          if ($shInc) { $iFlags += "/I$shInc" }
+          if ($umInc) { $iFlags += "/I$umInc" }
+          $iFlags += "/Iusermode"
 
           $sources = @("driver\driver.c", "driver\evasion.c", "driver\mouse_filter.c")
           foreach ($src in $sources) {
             $obj = "driver\obj\" + [IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
             Write-Host "CC  $src"
 
-            $clArgs = @("/nologo", "/c") + $iFlags + @(
-              "/kernel", "/GS-", "/Gz", "/GF", "/Gm-", "/EHs-c-", "/MT",
-              "/W4", "/WX-", "/O2", "/Oi",
-              "/D_KERNEL_MODE", "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
-              "/Fo`"$obj`"", "`"$src`""
-            )
+            $clArgs = @("/nologo", "/c") +
+                      $iFlags +
+                      @(
+                        "/kernel", "/GS-", "/Gz", "/GF", "/Gm-", "/EHs-c-", "/MT",
+                        "/W4", "/WX-", "/O2", "/Oi",
+                        "/D_KERNEL_MODE", "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
+                        "/Fo$obj",
+                        $src
+                      )
+
             & cl.exe @clArgs
             if ($LASTEXITCODE -ne 0) { Write-Error "Compile failed: $src"; exit 1 }
           }
 
           # ── Link ──────────────────────────────────────────────────────────
-          Write-Host "LINK driver\recoil.sys"
-          $objs = (Get-ChildItem driver\obj\*.obj | ForEach-Object { "`"$($_.FullName)`"" })
+          # То же правило: /LIBPATH:path без внутренних кавычек.
+          # Пути C:\wdk\... пробелов не содержат — PS не добавит лишних кавычек.
+
+          $objs = Get-ChildItem driver\obj\*.obj | ForEach-Object { $_.FullName }
+          Write-Host "LINK -> driver\recoil.sys"
 
           $linkArgs = @(
             "/nologo",
             "/SUBSYSTEM:NATIVE", "/DRIVER:WDM",
             "/NODEFAULTLIB", "/ENTRY:DriverEntry",
-            "/LIBPATH:`"$kmLib`"",
+            "/LIBPATH:$kmLib",
             "ntoskrnl.lib", "hal.lib", "wdm.lib", "wdmsec.lib", "wmilib.lib",
             "BufferOverflowFastFailK.lib",
             "/OUT:driver\recoil.sys",
