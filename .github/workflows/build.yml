@@ -26,7 +26,7 @@ jobs:
             main.cpp recoil.cpp logger.cpp profile.cpp overlay.cpp ^
             /Fe:RecoilComp.exe ^
             /link /SUBSYSTEM:WINDOWS ^
-            user32.lib shell32.lib kernel32.lib advapi32.lib
+            user32.lib shell32.lib kernel32.lib advapi32.lib gdi32.lib
 
       - uses: actions/upload-artifact@v4
         with:
@@ -40,7 +40,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v1
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Install WDK
         shell: powershell
@@ -60,19 +62,27 @@ jobs:
           $wdk = "$env:TEMP\wdksetup.exe"
           Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2249371" `
             -OutFile $wdk -UseBasicParsing
-          Write-Host "[*] Installing WDK + VS extension..."
+          Write-Host "[*] Installing WDK..."
           Start-Process $wdk `
             -ArgumentList "/features + /q /norestart /ceip off /vsPath `"$VS`"" `
             -Wait -NoNewWindow
 
+          # Установить VSIX вручную если props не появился
           $props = "C:\Program Files (x86)\Windows Kits\10\build\WindowsDriver.Default.props"
+          if (-not (Test-Path $props)) {
+            Write-Host "[*] Props not found, trying VSIX install..."
+            $vsix = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10" `
+              -Recurse -Filter "*.vsix" | Select-Object -First 1
+            if ($vsix) {
+              $vsixInstaller = "$VS\Common7\IDE\VSIXInstaller.exe"
+              Start-Process $vsixInstaller `
+                -ArgumentList "/quiet /force `"$($vsix.FullName)`"" `
+                -Wait -NoNewWindow
+            } else {
+              Write-Host "[!] No VSIX found"
+            }
+          }
           Write-Host "[check] Props exists: $(Test-Path $props)"
-
-          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" |
-            Where-Object { $_.Name -match "^10\." } |
-            Sort-Object Name -Descending |
-            Select-Object -First 3 |
-            ForEach-Object { Write-Host $_.Name }
 
       - name: Build driver
         shell: cmd
@@ -83,12 +93,25 @@ jobs:
           )
           :found
           echo [*] WDK version: %WDKVER%
-          msbuild driver\RecoilDriver.vcxproj ^
-            /p:Configuration=Release ^
-            /p:Platform=x64 ^
-            /p:LatestTargetPlatformVersion=%WDKVER% ^
-            /p:WindowsTargetPlatformVersion=%WDKVER% ^
-            /v:minimal
+
+          set KM_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\km
+          set SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\shared
+          set KM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\%WDKVER%\km\x64
+
+          md bin\Release 2>nul
+
+          cd driver
+          cl.exe /kernel /c /GS- /Gz /W3 /O2 /EHa- /nodefaultlib /Zl ^
+            /I "%KM_INC%" /I "%SH_INC%" /I "..\usermode" ^
+            /D_AMD64_ /DNDEBUG /D_KERNEL_MODE ^
+            driver.c evasion.c mouse_filter.c
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /DRIVER:WDM ^
+            /ENTRY:DriverEntry /OUT:..\bin\Release\recoil.sys ^
+            /LIBPATH:"%KM_LIB%" ^
+            ntoskrnl.lib hal.lib wdm.lib wdmsec.lib kbdmou.lib ^
+            driver.obj evasion.obj mouse_filter.obj
 
       - uses: actions/upload-artifact@v4
         with:
