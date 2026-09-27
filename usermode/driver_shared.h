@@ -2,6 +2,11 @@
 // Shared между user-mode и kernel driver — IOCTL интерфейс
 #pragma once
 
+#ifndef _KERNEL_MODE
+#include <windows.h>
+#include <winioctl.h>
+#endif
+
 #define RECOIL_DEVICE_NAME   L"\\Device\\RecoilDriver"
 #define RECOIL_SYMLINK_NAME  L"\\DosDevices\\RecoilDriver"
 #define RECOIL_USER_PATH     L"\\\\.\\RecoilDriver"
