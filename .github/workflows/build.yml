@@ -22,7 +22,6 @@ jobs:
           cd usermode
           cl.exe /std:c++17 /EHsc /O2 /W3 /MT ^
             /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-            /FI"winioctl.h" ^
             main.cpp recoil.cpp logger.cpp profile.cpp overlay.cpp ^
             /Fe:RecoilComp.exe ^
             /link /SUBSYSTEM:WINDOWS ^
@@ -67,22 +66,9 @@ jobs:
             -ArgumentList "/features + /q /norestart /ceip off /vsPath `"$VS`"" `
             -Wait -NoNewWindow
 
-          # Установить VSIX вручную если props не появился
-          $props = "C:\Program Files (x86)\Windows Kits\10\build\WindowsDriver.Default.props"
-          if (-not (Test-Path $props)) {
-            Write-Host "[*] Props not found, trying VSIX install..."
-            $vsix = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10" `
-              -Recurse -Filter "*.vsix" | Select-Object -First 1
-            if ($vsix) {
-              $vsixInstaller = "$VS\Common7\IDE\VSIXInstaller.exe"
-              Start-Process $vsixInstaller `
-                -ArgumentList "/quiet /force `"$($vsix.FullName)`"" `
-                -Wait -NoNewWindow
-            } else {
-              Write-Host "[!] No VSIX found"
-            }
-          }
-          Write-Host "[check] Props exists: $(Test-Path $props)"
+          $km = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km"
+          Write-Host "[check] km include exists: $(Test-Path $km)"
+          Write-Host "[check] ntddk.h exists:    $(Test-Path "$km\ntddk.h")"
 
       - name: Build driver
         shell: cmd
@@ -94,21 +80,24 @@ jobs:
           :found
           echo [*] WDK version: %WDKVER%
 
-          set KM_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\km
-          set SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\shared
-          set KM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\%WDKVER%\km\x64
+          set "KM_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\km"
+          set "SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\shared"
+          set "KM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\%WDKVER%\km\x64"
 
           md bin\Release 2>nul
 
           cd driver
-          cl.exe /kernel /c /GS- /Gz /W3 /O2 /EHa- /nodefaultlib /Zl ^
-            /I "%KM_INC%" /I "%SH_INC%" /I "..\usermode" ^
+          cl.exe /kernel /c /GS- /Gz /W3 /O2 /EHa- /Zl ^
+            /I "%KM_INC%" ^
+            /I "%SH_INC%" ^
+            /I "..\usermode" ^
             /D_AMD64_ /DNDEBUG /D_KERNEL_MODE ^
             driver.c evasion.c mouse_filter.c
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /DRIVER:WDM ^
-            /ENTRY:DriverEntry /OUT:..\bin\Release\recoil.sys ^
+            /ENTRY:DriverEntry ^
+            /OUT:..\bin\Release\recoil.sys ^
             /LIBPATH:"%KM_LIB%" ^
             ntoskrnl.lib hal.lib wdm.lib wdmsec.lib kbdmou.lib ^
             driver.obj evasion.obj mouse_filter.obj
