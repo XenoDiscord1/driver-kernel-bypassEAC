@@ -43,62 +43,53 @@ jobs:
         with:
           arch: x64
 
-      - name: Install WDK
+      - name: Install WDK via NuGet
         shell: powershell
         run: |
-          $VS = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+          Write-Host "[*] Installing WDK NuGet packages..."
+          nuget install Microsoft.Windows.WDK.x64      -OutputDirectory C:\wdk -NonInteractive
+          nuget install Microsoft.Windows.SDK.CPP      -OutputDirectory C:\wdk -NonInteractive
+          nuget install Microsoft.Windows.SDK.CPP.x64  -OutputDirectory C:\wdk -NonInteractive
 
-          Write-Host "[*] Downloading SDK..."
-          $sdk = "$env:TEMP\sdksetup.exe"
-          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2272610" `
-            -OutFile $sdk -UseBasicParsing
-          Write-Host "[*] Installing SDK..."
-          Start-Process $sdk `
-            -ArgumentList "/features + /q /norestart /ceip off" `
-            -Wait -NoNewWindow
+          $wdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.WDK.x64.*" |
+            Sort-Object Name -Descending | Select-Object -First 1
+          $sdkPkg = Get-ChildItem "C:\wdk" -Filter "Microsoft.Windows.SDK.CPP.*" |
+            Where-Object { $_.Name -notlike "*x64*" } |
+            Sort-Object Name -Descending | Select-Object -First 1
 
-          Write-Host "[*] Downloading WDK..."
-          $wdk = "$env:TEMP\wdksetup.exe"
-          Invoke-WebRequest "https://go.microsoft.com/fwlink/?linkid=2249371" `
-            -OutFile $wdk -UseBasicParsing
-          Write-Host "[*] Installing WDK..."
-          Start-Process $wdk `
-            -ArgumentList "/features + /q /norestart /ceip off /vsPath `"$VS`"" `
-            -Wait -NoNewWindow
+          Write-Host "[*] WDK package: $($wdkPkg.Name)"
+          Write-Host "[*] SDK package: $($sdkPkg.Name)"
 
-          $km = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km"
-          Write-Host "[check] km include exists: $(Test-Path $km)"
-          Write-Host "[check] ntddk.h exists:    $(Test-Path "$km\ntddk.h")"
+          $ntddk = Join-Path $wdkPkg.FullName "c\km\ntddk.h"
+          Write-Host "[check] ntddk.h: $(Test-Path $ntddk)"
+
+          # Сохраняем пути для следующего шага
+          Add-Content $env:GITHUB_ENV "WDK_KM_INC=$($wdkPkg.FullName)\c\km"
+          Add-Content $env:GITHUB_ENV "WDK_SH_INC=$($sdkPkg.FullName)\c\shared"
+          Add-Content $env:GITHUB_ENV "WDK_KM_LIB=$($wdkPkg.FullName)\lib\km\x64"
 
       - name: Build driver
         shell: cmd
         run: |
-          for /f "delims=" %%v in ('dir /b /ad "C:\Program Files (x86)\Windows Kits\10\Include\" ^| findstr /r "^10\." ^| sort /r') do (
-            set "WDKVER=%%v"
-            goto :found
-          )
-          :found
-          echo [*] WDK version: %WDKVER%
-
-          set "KM_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\km"
-          set "SH_INC=C:\Program Files (x86)\Windows Kits\10\Include\%WDKVER%\shared"
-          set "KM_LIB=C:\Program Files (x86)\Windows Kits\10\Lib\%WDKVER%\km\x64"
+          echo [*] KM include: %WDK_KM_INC%
+          echo [*] Shared:     %WDK_SH_INC%
+          echo [*] KM lib:     %WDK_KM_LIB%
 
           md bin\Release 2>nul
-
           cd driver
+
           cl.exe /kernel /c /GS- /Gz /W3 /O2 /EHa- /Zl ^
-            /I "%KM_INC%" ^
-            /I "%SH_INC%" ^
+            /I "%WDK_KM_INC%" ^
+            /I "%WDK_SH_INC%" ^
             /I "..\usermode" ^
-            /D_AMD64_ /DNDEBUG /D_KERNEL_MODE ^
+            /D_AMD64_ /DNDEBUG ^
             driver.c evasion.c mouse_filter.c
           if %errorlevel% neq 0 exit /b %errorlevel%
 
           link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /DRIVER:WDM ^
             /ENTRY:DriverEntry ^
             /OUT:..\bin\Release\recoil.sys ^
-            /LIBPATH:"%KM_LIB%" ^
+            /LIBPATH:"%WDK_KM_LIB%" ^
             ntoskrnl.lib hal.lib wdm.lib wdmsec.lib kbdmou.lib ^
             driver.obj evasion.obj mouse_filter.obj
 
