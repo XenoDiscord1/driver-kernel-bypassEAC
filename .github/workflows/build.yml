@@ -8,7 +8,7 @@ on:
 
 jobs:
 
-  # ── USERMODE — работает с прошлого раза, не трогаем ────────────────────────
+  # ── USERMODE — работает ──────────────────────────────────────────────────
   build-usermode:
     name: Usermode (CMake)
     runs-on: windows-latest
@@ -57,13 +57,24 @@ jobs:
       - name: Build kernel driver
         shell: pwsh
         run: |
-          # ── Находим пути рекурсивным поиском (не зависим от версии пакета) ──
-
+          # ── km headers: ntddk.h → папка km ──────────────────────────────
           $ntddkFile = Get-ChildItem "C:\wdk" -Recurse -Filter "ntddk.h" -ErrorAction SilentlyContinue |
                        Select-Object -First 1
           if (-not $ntddkFile) { Write-Error "ntddk.h not found"; exit 1 }
           $kmInc = $ntddkFile.Directory.FullName
 
+          # ── WDF/KMDF headers: wdf.h — в Wdf\KMDF\x.xx\ внутри пакета ──
+          $wdfFile = Get-ChildItem "C:\wdk" -Recurse -Filter "wdf.h" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-not $wdfFile) {
+            Write-Host "wdf.h not found. Package tree (depth 5):"
+            Get-ChildItem "C:\wdk" -Recurse -Depth 5 | Select-Object FullName | Format-Table -AutoSize
+            Write-Error "wdf.h not found — KMDF headers missing from NuGet package"
+            exit 1
+          }
+          $wdfInc = $wdfFile.Directory.FullName
+
+          # ── shared / um headers ──────────────────────────────────────────
           $basetsd  = Get-ChildItem "C:\wdk" -Recurse -Filter "basetsd.h" -ErrorAction SilentlyContinue |
                       Select-Object -First 1
           $windowsh = Get-ChildItem "C:\wdk" -Recurse -Filter "windows.h" -ErrorAction SilentlyContinue |
@@ -71,30 +82,40 @@ jobs:
           $shInc = if ($basetsd)  { $basetsd.Directory.FullName }  else { $null }
           $umInc = if ($windowsh) { $windowsh.Directory.FullName } else { $null }
 
+          # ── km lib: ntoskrnl.lib → папка lib ────────────────────────────
           $ntoskrnlLib = Get-ChildItem "C:\wdk" -Recurse -Filter "ntoskrnl.lib" -ErrorAction SilentlyContinue |
                          Where-Object { $_.FullName -match "\\x64" } |
                          Select-Object -First 1
           if (-not $ntoskrnlLib) { Write-Error "ntoskrnl.lib not found"; exit 1 }
           $kmLib = $ntoskrnlLib.Directory.FullName
 
-          Write-Host "[*] kmInc = $kmInc"
-          Write-Host "[*] shInc = $shInc"
-          Write-Host "[*] umInc = $umInc"
-          Write-Host "[*] kmLib = $kmLib"
+          # ── KMDF stub lib: WdfDriverStub.lib ────────────────────────────
+          $wdfStub = Get-ChildItem "C:\wdk" -Recurse -Filter "WdfDriverStub.lib" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "\\x64" } |
+                     Select-Object -First 1
+          $kmdfLib = if ($wdfStub) { $wdfStub.Directory.FullName } else { $null }
+
+          Write-Host "[*] kmInc  = $kmInc"
+          Write-Host "[*] wdfInc = $wdfInc"
+          Write-Host "[*] shInc  = $shInc"
+          Write-Host "[*] umInc  = $umInc"
+          Write-Host "[*] kmLib  = $kmLib"
+          Write-Host "[*] kmdfLib= $kmdfLib"
 
           New-Item -ItemType Directory -Force -Path driver\obj | Out-Null
 
-          # ── Compile ───────────────────────────────────────────────────────
-          # При & exe @array кавычки НЕ нужны — PS splatting передаёт аргументы
-          # как отдельные элементы через ProcessStartInfo напрямую.
-          # Бэктик-кавычки `"path`" внутри элементов = буквальные " в строке
-          # → cl.exe видит расширение " вместо .c и игнорирует файл (D9027).
-
-          $iFlags = @("/I$kmInc")
+          # ── Include flags ─────────────────────────────────────────────────
+          # /D_KERNEL_MODE убран — /kernel сам его определяет (C4117 reserved macro)
+          $iFlags = @("/I$kmInc", "/I$wdfInc")
           if ($shInc) { $iFlags += "/I$shInc" }
           if ($umInc) { $iFlags += "/I$umInc" }
           $iFlags += "/Iusermode"
 
+          # KMDF version — нужны для wdf.h чтобы выбрать правильный API-уровень
+          # 1.33 соответствует Windows 10 2004 / WDK 10.0.19041+
+          $kmdfDefs = @("/DKMDF_VERSION_MAJOR=1", "/DKMDF_VERSION_MINOR=33")
+
+          # ── Compile ───────────────────────────────────────────────────────
           $sources = @("driver\driver.c", "driver\evasion.c", "driver\mouse_filter.c")
           foreach ($src in $sources) {
             $obj = "driver\obj\" + [IO.Path]::GetFileNameWithoutExtension($src) + ".obj"
@@ -102,10 +123,11 @@ jobs:
 
             $clArgs = @("/nologo", "/c") +
                       $iFlags +
+                      $kmdfDefs +
                       @(
                         "/kernel", "/GS-", "/Gz", "/GF", "/Gm-", "/EHs-c-", "/MT",
                         "/W4", "/WX-", "/O2", "/Oi",
-                        "/D_KERNEL_MODE", "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
+                        "/D_AMD64_", "/DAMD64", "/D_WIN64", "/DNDEBUG",
                         "/Fo$obj",
                         $src
                       )
@@ -115,9 +137,6 @@ jobs:
           }
 
           # ── Link ──────────────────────────────────────────────────────────
-          # То же правило: /LIBPATH:path без внутренних кавычек.
-          # Пути C:\wdk\... пробелов не содержат — PS не добавит лишних кавычек.
-
           $objs = Get-ChildItem driver\obj\*.obj | ForEach-Object { $_.FullName }
           Write-Host "LINK -> driver\recoil.sys"
 
@@ -125,12 +144,15 @@ jobs:
             "/nologo",
             "/SUBSYSTEM:NATIVE", "/DRIVER:WDM",
             "/NODEFAULTLIB", "/ENTRY:DriverEntry",
-            "/LIBPATH:$kmLib",
+            "/LIBPATH:$kmLib"
+          )
+          if ($kmdfLib) { $linkArgs += "/LIBPATH:$kmdfLib" }
+          $linkArgs += @(
             "ntoskrnl.lib", "hal.lib", "wdm.lib", "wdmsec.lib", "wmilib.lib",
-            "BufferOverflowFastFailK.lib",
-            "/OUT:driver\recoil.sys",
-            "/MAP:driver\recoil.map"
-          ) + $objs
+            "BufferOverflowFastFailK.lib"
+          )
+          if ($wdfStub) { $linkArgs += "WdfDriverStub.lib" }
+          $linkArgs += @("/OUT:driver\recoil.sys", "/MAP:driver\recoil.map") + $objs
 
           & link.exe @linkArgs
           if ($LASTEXITCODE -ne 0) { Write-Error "Link failed"; exit 1 }
